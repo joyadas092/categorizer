@@ -41,9 +41,6 @@ CATEGORY_TOPICS = {
 
 shortnerfound = ['extp', 'bitli', 'bit.ly', 'bitly', 'bitili', 'biti']
 
-with open("category_keywords.json", "r") as f:
-    CATEGORY_KEYWORDS = json.load(f)
-
 # ===============================
 # 🧩 Helper Functions
 # ===============================
@@ -364,3 +361,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
