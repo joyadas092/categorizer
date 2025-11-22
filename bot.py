@@ -187,7 +187,32 @@ def should_notify(chat_id: int) -> bool:
 # ===============================
 # 🚀 Send Function (Aiogram)
 # ===============================
+def should_block_message(text: str) -> bool:
+    """
+    Block if '@' is followed by ANY letter (a-z / A-Z) without a space.
+    Allow if '@' is followed ONLY by digits (price like @141).
+    """
+    if not text:
+        return False
+
+    # find all occurrences of @something
+    matches = re.findall(r"@([A-Za-z0-9_]+)", text)
+
+    for m in matches:
+        # if it starts with digits ONLY → allowed
+        if m.isdigit():
+            continue
+
+        # if it contains any alphabet → block
+        if re.search(r"[A-Za-z]", m):
+            return True
+
+    return False
 async def send(category, message: types.Message):
+    text2 = message.caption if message.caption else message.text
+    if should_block_message(text2):
+        await bot.send_message(chat_id=5886397642,text='Just Blocked a Promo')
+        return
     try:
         topic = CATEGORY_TOPICS.get(category)
         if not topic:
@@ -361,4 +386,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
