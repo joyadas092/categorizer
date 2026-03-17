@@ -380,6 +380,8 @@ async def home():
 # ===============================
 async def main():
     print("🤖 Bot starting...")
+    await bot.delete_webhook(drop_pending_updates=True)
+
     bot_task = asyncio.create_task(dp.start_polling(bot))
     web_task = asyncio.create_task(app.run_task(host="0.0.0.0", port=8080))
     await asyncio.gather(bot_task, web_task)
