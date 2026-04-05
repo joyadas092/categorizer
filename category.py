@@ -1,155 +1,184 @@
-import tempfile
-from io import BytesIO
-
-import requests
-from PIL import Image, ImageDraw, ImageFont
-
-# from playwright.async_api import async_playwright
-from pyrogram import Client, filters, enums
-from pyrogram.errors import InputUserDeactivated, UserNotParticipant, FloodWait, UserIsBlocked, PeerIdInvalid
-import logging
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import re
 import asyncio
-from quart import Quart
-from unshortenit import UnshortenIt
-# from playwright.sync_api import sync_playwright
+import logging
 import os
-from dotenv import load_dotenv
+import re
 import json
+from quart import Quart
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+from unshortenit import UnshortenIt
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+
+
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
 load_dotenv()
-api_id = int(os.getenv("API_ID"))
-api_hash = os.getenv("API_HASH")
-bot_token = os.getenv("BOT_TOKEN")
 
-app = Client("my_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
-
-# Define a handler for the /start command
-bot = Quart(__name__)
-# bot.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
+# ===============================
+# 🔧 Configuration
+# ===============================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Please set it in your environment.")
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+app = Quart(__name__)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-source_channel_id = [-1002110764294]  # Replace with the source channel ID
 
-# TOPIC_CHAT_IDS = {
-#     "BabyPet": "https://t.me/LootwaliGroup/29",
-#     "FashionBeauty": "https://t.me/LootwaliGroup/5",
-#     "CarBike": "https://t.me/LootwaliGroup/26",
-#     "MobileLaptop": "https://t.me/LootwaliGroup/4",
-#     "KitchenHome": "https://t.me/LootwaliGroup/7",
-#     "SportsGymMed": "https://t.me/LootwaliGroup/13",
-#     "Electronics": "https://t.me/LootwaliGroup/3",
-#     "Grocery": "https://t.me/LootwaliGroup/2"
-# }
+SOURCE_CHANNEL_ID=-1002110764294
+# Optional: second channel to cross-post budget deals (≤ ₹150)
+# Set via env var BUDGET_CHANNEL_ID or replace with a hardcoded integer
+BUDGET_CHANNEL_ID = -1003898460377
+# Optional: second budget tier channel for ≤ ₹199
+# BUDGET_CHANNEL_ID_199 = -1003872969940
+# SOURCE_CHANNEL_ID2= -1002365489797
 CATEGORY_TOPICS = {
-    "BabyPet": {"chat_id": -1003104174203, "topic_id": 29},
-    "FashionBeauty": {"chat_id": -1003104174203, "topic_id": 5},
-    "CarBike": {"chat_id": -1003104174203, "topic_id": 26},
-    "MobileLaptop": {"chat_id": -1003104174203, "topic_id": 4},
-    "KitchenHome": {"chat_id": -1003104174203, "topic_id": 7},
-    "SportsGymMed": {"chat_id": -1003104174203, "topic_id": 13},
-    "Electronics": {"chat_id": -1003104174203, "topic_id": 3},
-    "Grocery": {"chat_id": -1003104174203, "topic_id": 2}
+    "Baby&PetProducts": {"chat_id": -1003104174203, "topic_id": 29},
+    "FashionBeauty&Apparels": {"chat_id": -1003104174203, "topic_id": 5},
+    "CarBike&Accessories": {"chat_id": -1003104174203, "topic_id": 26},
+    "MobileLaptop&Accessories": {"chat_id": -1003104174203, "topic_id": 4},
+    "KitchenFurnitures&HomeDecor": {"chat_id": -1003104174203, "topic_id": 7},
+    "SportsGym&Medicine": {"chat_id": -1003104174203, "topic_id": 13},
+    "Electronics&LargeAppliance": {"chat_id": -1003104174203, "topic_id": 3},
+    "Grocery&DailyUse": {"chat_id": -1003104174203, "topic_id": 2}
 }
 
 shortnerfound = ['extp', 'bitli', 'bit.ly', 'bitly', 'bitili', 'biti']
 
-with open("category_keywords.json", "r") as f:
-    CATEGORY_KEYWORDS = json.load(f)
+# ===============================
+# 🧩 Helper Functions
+# ===============================
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+CATEGORIES = [
+    "Baby&PetProducts", "FashionBeauty&Apparels", "CarBike&Accessories", "MobileLaptop&Accessories",
+    "KitchenFurnitures&HomeDecor", "SportsGym&Medicine", "Electronics&LargeAppliance", "Grocery&DailyUse"
+]
+
+def get_category_ai_gpt(text: str) -> str:
+    """
+    Use ChatGPT to classify text into one of the predefined categories.
+    """
+    if not text:
+        return None
+    if client is None:
+        # OpenAI client not configured; skip AI classification
+        return None
+
+    prompt = f"""
+    You are a smart text classifier for deal/product posts.
+    Choose exactly ONE best-matching category from this list:
+    {", ".join(CATEGORIES)}.
+
+    If the product doesn't fit any, respond only with "None".
+
+    Text:
+    {text}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",   # very fast and cheaper
+            messages=[
+                {"role": "system", "content": "You classify e-commerce products into fixed categories."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,  # deterministic output
+        )
+
+        category = response.choices[0].message.content.strip()
+        if category not in CATEGORIES:
+            return None
+        print(f"🧠 GPT categorized as → {category}")
+        return category
+    except Exception as e:
+        print(f"❌ GPT categorization error: {e}")
+        return None
+
 
 def get_category(text):
+    """
+    First tries static keyword-based classification.
+    If no keyword matches, calls GPT for AI-based categorization.
+    """
     text_lower = text.lower()
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text_lower:
-                return category
-    return None
+    #
+    # # 🧩 Step 1: Keyword-based check
+    # for category, keywords in CATEGORY_KEYWORDS.items():
+    #     for kw in keywords:
+    #         if kw in text_lower:
+    #             print(f"✅ Keyword match: '{kw}' found in {category}")
+    #             return category
 
+    # 🧠 Step 2: AI fallback using GPT
+    # print("⚙️ No keyword match found, asking GPT...")
+    try:
+        category =  get_category_ai_gpt(text)
+        return category
+    except Exception as e:
+        print(f"❌ Error while calling GPT: {e}")
+        return None
 
 def extract_link_from_text(text):
-    # Regular expression pattern to match a URL
     url_pattern = r'https?://\S+'
     urls = re.findall(url_pattern, text)
     return urls[0] if urls else None
 
-
-def tinycovert(text):
-    unshortened_urls = {}
-    urls = extract_link_from_text2(text)
-    for url in urls:
-        unshortened_urls[url] = tiny(url)
-    for original_url, unshortened_url in unshortened_urls.items():
-        text = text.replace(original_url, unshortened_url)
-    return text
-
-
-def tiny(long_url):
-    url = 'http://tinyurl.com/api-create.php?url='
-
-    response = requests.get(url + long_url)
-    short_url = response.text
-    return short_url
-
-
 def extract_link_from_text2(text):
-    # Regular expression pattern to match a URL
     url_pattern = r'https?://\S+'
-    urls = re.findall(url_pattern, text)
-    return urls
-
+    return re.findall(url_pattern, text)
 
 def unshorten_url2(short_url):
-    unshortener = UnshortenIt()
-    shorturi = unshortener.unshorten(short_url)
-    # print(shorturi)
-    return shorturi
+    try:
+        unshortener = UnshortenIt()
+        return unshortener.unshorten(short_url)
+    except:
+        return short_url
 
-
-# async def unshorten_url(url):
-#     try:
-#         async with async_playwright() as p:
-#             browser = await p.chromium.launch(headless=True)
-#             page = await browser.new_page()
-#             await page.goto(url)
-#             final_url = page.url
-#             await browser.close()
-#             return final_url
-#     except Exception as e:
-#         print(f"Error: {e}")
-#         return None
-
+async def expand_short_links(text: str) -> str:
+    """
+    Expand shortener links in text without blocking the event loop.
+    """
+    if not text:
+        return text
+    if not any(keyword in text for keyword in shortnerfound):
+        return text
+    urls = extract_link_from_text2(text) or []
+    if not urls:
+        return text
+    # Run unshortening in background threads
+    tasks = [asyncio.to_thread(unshorten_url2, u) for u in urls]
+    expanded = await asyncio.gather(*tasks, return_exceptions=True)
+    result = text
+    for original_url, expanded_url in zip(urls, expanded):
+        if isinstance(expanded_url, Exception):
+            continue
+        result = result.replace(original_url, expanded_url)
+    return result
 
 def removedup(text):
     urls = re.findall(r"https?://\S+", text)
-    unique_urls = []
-    seen = set()
-
+    unique_urls, seen = [], set()
     for url in urls:
         if url not in seen:
             seen.add(url)
             unique_urls.append(url)
-
-    # Remove duplicate URL lines
     lines = text.split("\n")
-    cleaned_lines = []
-    seen_urls = set()
-
+    cleaned_lines, seen_urls = [], set()
     for line in lines:
         if any(url in line for url in unique_urls):
-            # If the URL in the line is already seen, skip it
             url_in_line = next((url for url in unique_urls if url in line), None)
             if url_in_line and url_in_line in seen_urls:
                 continue
             seen_urls.add(url_in_line)
-
         cleaned_lines.append(line)
-
-    # Join cleaned lines back
-    cleaned_text = "\n".join(cleaned_lines).strip()
-
-    return cleaned_text
-
+    return "\n".join(cleaned_lines).strip()
 
 def findpcode(url):
     try:
@@ -157,195 +186,278 @@ def findpcode(url):
         product_code_match2 = re.search(r'/dp/([A-Za-z0-9]{10})', url)
         product_code = product_code_match.group(1) if product_code_match else product_code_match2.group(1)
         return product_code
-    except Exception as e:
-        return
-
+    except:
+        return None
 
 def compilehyperlink(message):
     text = message.caption if message.caption else message.text
     inputvalue = text
     hyperlinkurl = []
     entities = message.caption_entities if message.caption else message.entities
-    for entity in entities:
-        # new_entities.append(entity)
-        if entity.url is not None:
+    for entity in entities or []:
+        if entity.url:
             hyperlinkurl.append(entity.url)
     pattern = re.compile(r'Buy Now')
-
-    inputvalue = pattern.sub(lambda x: hyperlinkurl.pop(0), inputvalue).replace('Regular Price', 'MRP')
+    inputvalue = pattern.sub(lambda x: hyperlinkurl.pop(0) if hyperlinkurl else 'Buy Now', inputvalue)
+    inputvalue = inputvalue.replace('Regular Price', 'MRP')
     if "😱 Deal Time" in inputvalue:
-        # Remove the part
         inputvalue = removedup(inputvalue)
         inputvalue = (inputvalue.split("😱 Deal Time")[0]).strip()
     return inputvalue
 
-# =========================
-# 📌 Silent Control
-# =========================
-silent_interval = 3   # Default: notify every 2nd post
-post_counter = {}     # Track posts per target channel
+# ===============================
+# 💸 Price Extraction (Regex + AI fallback)
+# ===============================
+PRICE_THRESHOLD_150 = 150
+PRICE_THRESHOLD_199 = 199
+
+def extract_price_regex(text: str):
+    if not text:
+        return None
+    # Common INR price patterns: ₹149, Rs. 149, INR 149, 149/-, 149 rs
+    patterns = [
+        r"(?:₹|Rs\.?\s*|INR\s*)(\d{1,6}(?:\.\d{1,2})?)",
+        r"(\d{1,6}(?:\.\d{1,2})?)\s*/-",
+        r"(\d{1,6}(?:\.\d{1,2})?)\s*(?:rs|inr)\b",
+        r"price\s*[:\-]?\s*(?:₹\s*)?(\d{1,6}(?:\.\d{1,2})?)",
+    ]
+    candidates = []
+    for p in patterns:
+        for m in re.findall(p, text, flags=re.IGNORECASE):
+            try:
+                candidates.append(float(m))
+            except:
+                continue
+    if not candidates:
+        return None
+    # Return the minimum plausible price found
+    return min(candidates)
+
+def extract_price_ai(text: str):
+    if not text or client is None:
+        return None
+    prompt = f"""
+    Extract the most likely current price in Indian Rupees from the text.
+    - If multiple prices are present (e.g., MRP, deal price), return the LOWEST deal/final price.
+    - Return ONLY a number (no currency symbol), like 149 or 149.00.
+    - If no price is present, return "None".
+
+    Text:
+    {text}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Extract the lowest deal price in INR as a number only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        if content.lower() == "none":
+            return None
+        # keep only first number if any additional text slipped
+        m = re.search(r"\d+(?:\.\d+)?", content)
+        if not m:
+            return None
+        return float(m.group(0))
+    except Exception as e:
+        print(f"❌ GPT price extraction error: {e}")
+        return None
+
+def get_product_price(text: str):
+    # Try regex first
+    price = extract_price_regex(text)
+    if price is not None:
+        return price
+    # Fallback to AI
+    return extract_price_ai(text)
+
+# ===============================
+# 🔕 Silent Control
+# ===============================
+silent_interval = 5
+post_counter = {}
 def should_notify(chat_id: int) -> bool:
-    """Return True if this post should notify, False if silent."""
     global post_counter, silent_interval
-    if chat_id not in post_counter:
-        post_counter[chat_id] = 0
-    post_counter[chat_id] += 1
+    post_counter[chat_id] = post_counter.get(chat_id, 0) + 1
     return post_counter[chat_id] % silent_interval == 0
 
+# ===============================
 
+# ===============================
+# 🚀 Send Function (Aiogram)
+# ===============================
+def should_block_message(text: str) -> bool:
+    """
+    Block if '@' is followed by ANY letter (a-z / A-Z) without a space.
+    Allow if '@' is followed ONLY by digits (price like @141).
+    """
+    if not text:
+        return False
 
-async def send(category, message):
+    # find all occurrences of @something
+    matches = re.findall(r"@([A-Za-z0-9_]+)", text)
+
+    for m in matches:
+        # if it starts with digits ONLY → allowed
+        if m.isdigit():
+            continue
+
+        # if it contains any alphabet → block
+        if re.search(r"[A-Za-z]", m):
+            return True
+
+    return False
+async def send(category, message: types.Message):
+    text2 = message.caption if message.caption else message.text
+    if should_block_message(text2):
+        await bot.send_message(chat_id=5886397642,text='Just Blocked a Promo')
+        return
     try:
-        # Get topic info
         topic = CATEGORY_TOPICS.get(category)
         if not topic:
             print(f"⚠️ Unknown category: {category}")
             return
 
         chat_id = topic["chat_id"]
-        topic_id = topic["topic_id"]
-
+        thread_id = topic.get("topic_id")  # 👈 yahan se thread ID lenge (agar exist karta hai)
         notify = should_notify(chat_id)
-
-        # Prepare text
-        modifiedtxt = compilehyperlink(message).replace('@under_99_loot_deals', '@shopsymeesho')
-
-        # --- Handle Photo Messages ---
+        final_caption = compilehyperlink(message)
+        
+        # ✅ Agar photo hai
         if message.photo:
-            final_caption = await build_caption_with_links(modifiedtxt)
-            await app.send_photo(
-                chat_id=-1003104174203,
-                # message_thread_id=topic_id,
-                photo=message.photo.file_id,
-                caption=f"<b>{final_caption}</b>",
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=message.photo[-1].file_id,
+                caption=f"{final_caption}",
+                message_thread_id=thread_id if thread_id else None,  # 👈 optional thread_id
                 disable_notification=not notify
             )
-
-        # --- Handle Text Messages ---
-        elif message.text:
-            final_caption = await build_caption_with_links(modifiedtxt)
-            await app.send_message(
+        else:
+            await bot.send_message(
                 chat_id=chat_id,
-                # message_thread_id=topic_id,
-                text=f"<b>{final_caption}</b>",
+                text=f"{final_caption}",
+                message_thread_id=thread_id if thread_id else None,  # 👈 optional thread_id
                 disable_web_page_preview=True,
                 disable_notification=not notify
             )
 
+        print(f"✅ Message sent to {chat_id} (thread: {thread_id})")
+
     except Exception as e:
         print(f"❌ Error in send function: {e}")
 
+async def send_budget_149(message: types.Message, final_caption: str):
+    if not BUDGET_CHANNEL_ID:
+        return
 
-async def build_caption_with_links(text):
-    """Utility to modify text and add Buy Now / PriceHistory links"""
     try:
-        if any(k in text for k in ['tinyurl', 'amazon', 'amzn']):
-            urls = extract_link_from_text2(text)
-            for url in urls:
-                pid = findpcode(unshorten_url2(url))
-                if pid:
-                    if 'amzn' in url:
-                        text = text.replace(
-                            url,
-                            f"{url}\n\n<a href='t.me/Amazon_Pricehistory_bot?start={pid}'>📊 PriceHistory</a>"
-                        )
-                    else:
-                        text = text.replace(
-                            url,
-                            f"<b><a href={url}>Buy Now</a> | <a href='t.me/Amazon_Pricehistory_bot?start={pid}'>📊 PriceHistory</a></b>"
-                        )
-                else:
-                    if 'amzn' not in url:
-                        text = text.replace(url, f'<b><a href={url}>Buy Now</a></b>')
-        return text
+        extra_html = (
+            "<b>🛍️ 👉 <a href='https://t.me/addlist/WhyK9RPZHdU4MGNl'>Click & Join More Deals</a></b>"
+        )
+        Promo = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="🏠 Join Deals Group",
+                    url="https://t.me/+VQo_PHfTYW02MGI1",
+                    style="success"
+                )]])
+        if message.photo:
+            await bot.send_photo(
+                chat_id=BUDGET_CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=f"<b>{final_caption}</b>\n\n{extra_html}",
+                reply_markup=Promo,
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(
+                chat_id=BUDGET_CHANNEL_ID,
+                text=f"{final_caption}",
+                disable_web_page_preview=True
+            )
+        print(f"💸 Budget post sent to {BUDGET_CHANNEL_ID}")
     except Exception as e:
-        print(f"⚠️ Error in build_caption_with_links: {e}")
-        return text
+        print(f"❌ Error sending to budget channel: {e}")
+
+# async def send_budget_199(message: types.Message, final_caption: str):
+#     if not BUDGET_CHANNEL_ID_199:
+#         return
+#     try:
+#         extra_html = (
+#             "<b>👉 <a href='https://t.me/addlist/3G8HfhX3WSEwNmI1'>Click & Join All Deals </a>👈</b>"
+#         )
+#         Promo = types.InlineKeyboardMarkup(
+#         inline_keyboard=[
+#             [
+#                 types.InlineKeyboardButton(
+#                     text="🛍️ Join Premium Offers",
+#                     url="https://t.me/+vUHFBOFLHd02MTZl",
+#                     style="danger"
+#                 )]])
+#         if message.photo:
+#             await bot.send_photo(
+#                 chat_id=BUDGET_CHANNEL_ID_199,
+#                 photo=message.photo[-1].file_id,
+#                 caption=f"<b>{final_caption}</b>\n\n{extra_html}",
+#                 reply_markup=Promo,
+#                 parse_mode="HTML"
+#             )
+#         else:
+#             await bot.send_message(
+#                 chat_id=BUDGET_CHANNEL_ID_199,
+#                 text=f"{final_caption}",
+#                 disable_web_page_preview=True
+#             )
+#         print(f"💸 Budget-199 post sent to {BUDGET_CHANNEL_ID_199}")
+#     except Exception as e:
+#         print(f"❌ Error sending to budget-199 channel: {e}")
 
 
-@bot.route('/')
-async def hello():
-    return 'Hello, world!'
+# ===============================
+# 🤖 Commands
+# ===============================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("✅ Join @Dealdoom Bro")
 
-
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    await app.send_message(message.chat.id, "ahaann")
-
-@app.on_message(filters.regex("silent_") & filters.user(5886397642))
-async def set_silent_interval(client, message):
+@dp.message(F.text.startswith("silent_"))
+async def set_silent_interval_cmd(message: types.Message):
     global silent_interval
     try:
-        __, arg = message.text.split('_')
+        _, arg = message.text.split('_')
         silent_interval = int(arg)
-        await message.reply_text(f"✅ Silent interval set: Every {silent_interval} post will notify.")
+        await message.reply(f"✅ Silent interval set: Every {silent_interval}th post will notify.")
     except:
-        await message.reply_text("❌ Usage: /silent_2")
-################forward on off#################################################################
-global forward
-forward = True
+        await message.reply("❌ Usage: silent_2")
 
 
-@app.on_message(filters.command('forward') & filters.user(5886397642))
-async def forwardtochannel(app, message):
-    await message.reply(text='Forward Status', reply_markup=InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Turn ON", callback_data='forward on')],
-         [InlineKeyboardButton("Turn Off", callback_data='forward off')]])
-                        )
-
-
-forward_off = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("Turn Off", callback_data='forward off')]])
-forward_on = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("Turn ON", callback_data='forward on')]])
-
-
-@app.on_callback_query()
-async def callback_query(app, CallbackQuery):
-    global forward
-    if CallbackQuery.data == 'forward off':
-        await CallbackQuery.edit_message_text('Forward to Channel Status turned Off', reply_markup=forward_on)
-        forward = False
-    elif CallbackQuery.data == 'forward on':
-        await CallbackQuery.edit_message_text('Forward to Channel Status turned On', reply_markup=forward_off)
-        forward = True
-
-
-########################################################################################
-
-@app.on_message(filters.chat(source_channel_id))
-async def forward_message(client, message):
+# ✅ Listen to posts from the source channel
+@dp.channel_post()
+async def handle_channel_post(message: types.Message):
     try:
-        if not forward:
+        if message.chat.id != SOURCE_CHANNEL_ID:
             return
+        # 1️ Extract base text (preserve full text, not just last link)
+        base_text = message.caption or message.text or ""
+        # Optionally normalize hyperlinks within the text/caption
+        compiled_text = compilehyperlink(message) or base_text
+        # 2️⃣ Expand short links without blocking loop
+        inputvalue = await expand_short_links(compiled_text)
 
-        # 1️⃣ Extract text or caption with links
-        inputvalue = ""
-        if message.caption_entities:
-            for entity in message.caption_entities:
-                if entity.url:
-                    inputvalue = entity.url
-        if not inputvalue and message.caption:
-            inputvalue = message.caption
-
-        if message.entities:
-            for entity in message.entities:
-                if entity.url:
-                    inputvalue = entity.url
-        if not inputvalue and message.text:
-            inputvalue = message.text
-
-        # 2️⃣ Expand short links
-        if any(keyword in inputvalue for keyword in shortnerfound):
-            unshortened_urls = {}
-            urls = extract_link_from_text2(inputvalue)
-            for url in urls:
-                unshortened_urls[url] = unshorten_url2(url)
-            for original_url, unshortened_url in unshortened_urls.items():
-                inputvalue = inputvalue.replace(original_url, unshortened_url)
-
-        # 3️⃣ Detect category using keywords JSON
-        category = get_category(inputvalue)
+        # 2.5️⃣ Cross-post to budget channel if price ≤ threshold
+        try:
+            price = await asyncio.to_thread(get_product_price, inputvalue)
+            if price is not None:
+                if price <= PRICE_THRESHOLD_150:
+                    await send_budget_149(message, inputvalue)
+        except Exception as e:
+            print(f"⚠️ Budget price check failed: {e}")
+        # 3️⃣ Detect category (run potentially-blocking call in a thread)
+        category = await asyncio.to_thread(get_category, inputvalue)
 
         if category:
             topic = CATEGORY_TOPICS.get(category)
@@ -354,38 +466,58 @@ async def forward_message(client, message):
                 return
 
             chat_id = topic["chat_id"]
-            print(f"✅ Matched '{category}' → sending to topic ID {topic['topic_id']}")
+            thread_id = topic.get("topic_id")
+
+            print(f"✅ Matched '{category}' → sending to thread {thread_id}")
+
             await send(category, message)
         else:
             print("⚠️ No matching category found, skipping.")
 
     except Exception as e:
-        print(f"❌ Error in forward_message: {e}")
+        print(f"❌ Error in handle_channel_post: {e}")
 
+# @dp.channel_post()
+# async def handle_channel_post2(message: types.Message):
+#     try:
+#         if message.chat.id != SOURCE_CHANNEL_ID2:
+#             return
+#         # 1️ Extract base text (preserve full text, not just last link)
+#         base_text = message.caption or message.text or ""
+#         # Optionally normalize hyperlinks within the text/caption
+#         compiled_text = compilehyperlink(message) or base_text
+#         # 2️⃣ Expand short links without blocking loop
+#         inputvalue = await expand_short_links(compiled_text)
+#
+#         # 2.5️⃣ Cross-post to budget channel if price ≤ threshold
+#         try:
+#             price = await asyncio.to_thread(get_product_price, inputvalue)
+#             if price is not None:
+#                 if price <= PRICE_THRESHOLD_199:
+#                     await send_budget_199(message, inputvalue)
+#         except Exception as e:
+#             print(f"⚠️ Budget price check failed: {e}")
+#         # 3️⃣ Detect category (run potentially-blocking call in a thread)
+#
+#     except Exception as e:
+#         print(f"❌ Error in handle_channel_post2: {e}")
+# ===============================
+# 🌐 Quart Web Endpoint
+# ===============================
+@app.route("/")
+async def home():
+    return "Hello from Aiogram + Quart bot!"
 
+# ===============================
+# 🏁 Run Everything
+# ===============================
+async def main():
+    print("🤖 Bot starting...")
+    await bot.delete_webhook(drop_pending_updates=True)
 
-@bot.before_serving
-async def before_serving():
-    await app.start()
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    web_task = asyncio.create_task(app.run_task(host="0.0.0.0", port=8080))
+    await asyncio.gather(bot_task, web_task)
 
-
-@bot.after_serving
-async def after_serving():
-    await app.stop()
-
-
-# if __name__ == '__main__':
-
-# bot.run(port=8000)
-if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.create_task(bot.run_task(host='0.0.0.0', port=8080))
-    loop.run_forever()
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    asyncio.run(main())
