@@ -20,6 +20,8 @@ load_dotenv()
 # 🔧 Configuration
 # ===============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Please set it in your environment.")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 app = Quart(__name__)
@@ -28,6 +30,12 @@ logger.setLevel(logging.INFO)
 
 
 SOURCE_CHANNEL_ID=-1002110764294
+# Optional: second channel to cross-post budget deals (≤ ₹150)
+# Set via env var BUDGET_CHANNEL_ID or replace with a hardcoded integer
+BUDGET_CHANNEL_ID = -1003898460377
+# Optional: second budget tier channel for ≤ ₹199
+# BUDGET_CHANNEL_ID_199 = -1003872969940
+# SOURCE_CHANNEL_ID2= -1002365489797
 CATEGORY_TOPICS = {
     "Baby&PetProducts": {"chat_id": -1003104174203, "topic_id": 29},
     "FashionBeauty&Apparels": {"chat_id": -1003104174203, "topic_id": 5},
@@ -45,7 +53,8 @@ shortnerfound = ['extp', 'bitli', 'bit.ly', 'bitly', 'bitili', 'biti']
 # 🧩 Helper Functions
 # ===============================
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 CATEGORIES = [
     "Baby&PetProducts", "FashionBeauty&Apparels", "CarBike&Accessories", "MobileLaptop&Accessories",
@@ -57,6 +66,9 @@ def get_category_ai_gpt(text: str) -> str:
     Use ChatGPT to classify text into one of the predefined categories.
     """
     if not text:
+        return None
+    if client is None:
+        # OpenAI client not configured; skip AI classification
         return None
 
     prompt = f"""
@@ -129,6 +141,27 @@ def unshorten_url2(short_url):
     except:
         return short_url
 
+async def expand_short_links(text: str) -> str:
+    """
+    Expand shortener links in text without blocking the event loop.
+    """
+    if not text:
+        return text
+    if not any(keyword in text for keyword in shortnerfound):
+        return text
+    urls = extract_link_from_text2(text) or []
+    if not urls:
+        return text
+    # Run unshortening in background threads
+    tasks = [asyncio.to_thread(unshorten_url2, u) for u in urls]
+    expanded = await asyncio.gather(*tasks, return_exceptions=True)
+    result = text
+    for original_url, expanded_url in zip(urls, expanded):
+        if isinstance(expanded_url, Exception):
+            continue
+        result = result.replace(original_url, expanded_url)
+    return result
+
 def removedup(text):
     urls = re.findall(r"https?://\S+", text)
     unique_urls, seen = [], set()
@@ -171,6 +204,75 @@ def compilehyperlink(message):
         inputvalue = removedup(inputvalue)
         inputvalue = (inputvalue.split("😱 Deal Time")[0]).strip()
     return inputvalue
+
+# ===============================
+# 💸 Price Extraction (Regex + AI fallback)
+# ===============================
+PRICE_THRESHOLD_150 = 150
+PRICE_THRESHOLD_199 = 199
+
+def extract_price_regex(text: str):
+    if not text:
+        return None
+    # Common INR price patterns: ₹149, Rs. 149, INR 149, 149/-, 149 rs
+    patterns = [
+        r"(?:₹|Rs\.?\s*|INR\s*)(\d{1,6}(?:\.\d{1,2})?)",
+        r"(\d{1,6}(?:\.\d{1,2})?)\s*/-",
+        r"(\d{1,6}(?:\.\d{1,2})?)\s*(?:rs|inr)\b",
+        r"price\s*[:\-]?\s*(?:₹\s*)?(\d{1,6}(?:\.\d{1,2})?)",
+    ]
+    candidates = []
+    for p in patterns:
+        for m in re.findall(p, text, flags=re.IGNORECASE):
+            try:
+                candidates.append(float(m))
+            except:
+                continue
+    if not candidates:
+        return None
+    # Return the minimum plausible price found
+    return min(candidates)
+
+def extract_price_ai(text: str):
+    if not text or client is None:
+        return None
+    prompt = f"""
+    Extract the most likely current price in Indian Rupees from the text.
+    - If multiple prices are present (e.g., MRP, deal price), return the LOWEST deal/final price.
+    - Return ONLY a number (no currency symbol), like 149 or 149.00.
+    - If no price is present, return "None".
+
+    Text:
+    {text}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Extract the lowest deal price in INR as a number only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        if content.lower() == "none":
+            return None
+        # keep only first number if any additional text slipped
+        m = re.search(r"\d+(?:\.\d+)?", content)
+        if not m:
+            return None
+        return float(m.group(0))
+    except Exception as e:
+        print(f"❌ GPT price extraction error: {e}")
+        return None
+
+def get_product_price(text: str):
+    # Try regex first
+    price = extract_price_regex(text)
+    if price is not None:
+        return price
+    # Fallback to AI
+    return extract_price_ai(text)
 
 # ===============================
 # 🔕 Silent Control
@@ -222,9 +324,8 @@ async def send(category, message: types.Message):
         chat_id = topic["chat_id"]
         thread_id = topic.get("topic_id")  # 👈 yahan se thread ID lenge (agar exist karta hai)
         notify = should_notify(chat_id)
-        modifiedtxt = compilehyperlink(message).replace('@under_99_loot_deals', '@shopsymeesho')
-        final_caption = modifiedtxt
-
+        final_caption = compilehyperlink(message)
+        
         # ✅ Agar photo hai
         if message.photo:
             await bot.send_photo(
@@ -248,15 +349,82 @@ async def send(category, message: types.Message):
     except Exception as e:
         print(f"❌ Error in send function: {e}")
 
+async def send_budget_149(message: types.Message, final_caption: str):
+    if not BUDGET_CHANNEL_ID:
+        return
+
+    try:
+        extra_html = (
+            "<b>🛍️ 👉 <a href='https://t.me/addlist/WhyK9RPZHdU4MGNl'>Click & Join More Deals</a></b>"
+        )
+        Promo = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="🏠 Join Deals Group",
+                    url="https://t.me/+VQo_PHfTYW02MGI1",
+                    style="success"
+                )]])
+        if message.photo:
+            await bot.send_photo(
+                chat_id=BUDGET_CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=f"<b>{final_caption}</b>\n\n{extra_html}",
+                reply_markup=Promo,
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(
+                chat_id=BUDGET_CHANNEL_ID,
+                text=f"{final_caption}",
+                disable_web_page_preview=True
+            )
+        print(f"💸 Budget post sent to {BUDGET_CHANNEL_ID}")
+    except Exception as e:
+        print(f"❌ Error sending to budget channel: {e}")
+
+# async def send_budget_199(message: types.Message, final_caption: str):
+#     if not BUDGET_CHANNEL_ID_199:
+#         return
+#     try:
+#         extra_html = (
+#             "<b>👉 <a href='https://t.me/addlist/3G8HfhX3WSEwNmI1'>Click & Join All Deals </a>👈</b>"
+#         )
+#         Promo = types.InlineKeyboardMarkup(
+#         inline_keyboard=[
+#             [
+#                 types.InlineKeyboardButton(
+#                     text="🛍️ Join Premium Offers",
+#                     url="https://t.me/+vUHFBOFLHd02MTZl",
+#                     style="danger"
+#                 )]])
+#         if message.photo:
+#             await bot.send_photo(
+#                 chat_id=BUDGET_CHANNEL_ID_199,
+#                 photo=message.photo[-1].file_id,
+#                 caption=f"<b>{final_caption}</b>\n\n{extra_html}",
+#                 reply_markup=Promo,
+#                 parse_mode="HTML"
+#             )
+#         else:
+#             await bot.send_message(
+#                 chat_id=BUDGET_CHANNEL_ID_199,
+#                 text=f"{final_caption}",
+#                 disable_web_page_preview=True
+#             )
+#         print(f"💸 Budget-199 post sent to {BUDGET_CHANNEL_ID_199}")
+#     except Exception as e:
+#         print(f"❌ Error sending to budget-199 channel: {e}")
+
 
 # ===============================
 # 🤖 Commands
 # ===============================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("✅ Bot is running successfully!")
+    await message.answer("✅ Join @Dealdoom Bro")
 
-@dp.message(F.text.startswith("silent_") & F.from_user.id == 5886397642)
+@dp.message(F.text.startswith("silent_"))
 async def set_silent_interval_cmd(message: types.Message):
     global silent_interval
     try:
@@ -266,55 +434,6 @@ async def set_silent_interval_cmd(message: types.Message):
     except:
         await message.reply("❌ Usage: silent_2")
 
-# ===============================
-# 🧭 Forward Toggle
-# ===============================
-# forward = True
-#
-# @dp.message(Command("forward"))
-# async def forward_control(message: types.Message):
-#     if message.from_user.id != 5886397642:
-#         return
-#     buttons = [
-#         [InlineKeyboardButton("Turn ON", callback_data='forward_on')],
-#         [InlineKeyboardButton("Turn OFF", callback_data='forward_off')]
-#     ]
-#     await message.answer("Forward Status", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-#
-# @dp.callback_query(F.data.in_({'forward_on', 'forward_off'}))
-# async def callback_forward_toggle(callback: types.CallbackQuery):
-#     global forward
-#     if callback.data == 'forward_off':
-#         forward = False
-#         await callback.message.edit_text("❌ Forward turned OFF")
-#     else:
-#         forward = True
-#         await callback.message.edit_text("✅ Forward turned ON")
-
-# ===============================
-# 🧾 Message Forwarding
-# ===============================
-# @dp.message()
-# async def forward_message(message: types.Message):
-#     try:
-#         global forward
-#         if not forward:
-#             return
-#
-#         text = message.caption or message.text or ""
-#         if any(k in text for k in shortnerfound):
-#             for url in extract_link_from_text2(text):
-#                 text = text.replace(url, unshorten_url2(url))
-#
-#         category = get_category(text)
-#         if category:
-#             print(f"✅ Matched '{category}' → forwarding")
-#             await send(category, message)
-#         else:
-#             print("⚠️ No category matched")
-#
-#     except Exception as e:
-#         print(f"❌ Error in forward_message: {e}")
 
 # ✅ Listen to posts from the source channel
 @dp.channel_post()
@@ -322,33 +441,23 @@ async def handle_channel_post(message: types.Message):
     try:
         if message.chat.id != SOURCE_CHANNEL_ID:
             return
-        # 1️Extract text or caption with links
-        inputvalue = ""
-        if message.caption_entities:
-            for entity in message.caption_entities:
-                if entity.url:
-                    inputvalue = entity.url
-        if not inputvalue and message.caption:
-            inputvalue = message.caption
+        # 1️ Extract base text (preserve full text, not just last link)
+        base_text = message.caption or message.text or ""
+        # Optionally normalize hyperlinks within the text/caption
+        compiled_text = compilehyperlink(message) or base_text
+        # 2️⃣ Expand short links without blocking loop
+        inputvalue = await expand_short_links(compiled_text)
 
-        if message.entities:
-            for entity in message.entities:
-                if entity.url:
-                    inputvalue = entity.url
-        if not inputvalue and message.text:
-            inputvalue = message.text
-
-        # 2️⃣ Expand short links
-        if any(keyword in inputvalue for keyword in shortnerfound):
-            unshortened_urls = {}
-            urls = extract_link_from_text2(inputvalue)
-            for url in urls:
-                unshortened_urls[url] = unshorten_url2(url)
-            for original_url, unshortened_url in unshortened_urls.items():
-                inputvalue = inputvalue.replace(original_url, unshortened_url)
-
-        # 3️⃣ Detect category using keywords
-        category = get_category(inputvalue)
+        # 2.5️⃣ Cross-post to budget channel if price ≤ threshold
+        try:
+            price = await asyncio.to_thread(get_product_price, inputvalue)
+            if price is not None:
+                if price <= PRICE_THRESHOLD_150:
+                    await send_budget_149(message, inputvalue)
+        except Exception as e:
+            print(f"⚠️ Budget price check failed: {e}")
+        # 3️⃣ Detect category (run potentially-blocking call in a thread)
+        category = await asyncio.to_thread(get_category, inputvalue)
 
         if category:
             topic = CATEGORY_TOPICS.get(category)
@@ -368,6 +477,30 @@ async def handle_channel_post(message: types.Message):
     except Exception as e:
         print(f"❌ Error in handle_channel_post: {e}")
 
+# @dp.channel_post()
+# async def handle_channel_post2(message: types.Message):
+#     try:
+#         if message.chat.id != SOURCE_CHANNEL_ID2:
+#             return
+#         # 1️ Extract base text (preserve full text, not just last link)
+#         base_text = message.caption or message.text or ""
+#         # Optionally normalize hyperlinks within the text/caption
+#         compiled_text = compilehyperlink(message) or base_text
+#         # 2️⃣ Expand short links without blocking loop
+#         inputvalue = await expand_short_links(compiled_text)
+#
+#         # 2.5️⃣ Cross-post to budget channel if price ≤ threshold
+#         try:
+#             price = await asyncio.to_thread(get_product_price, inputvalue)
+#             if price is not None:
+#                 if price <= PRICE_THRESHOLD_199:
+#                     await send_budget_199(message, inputvalue)
+#         except Exception as e:
+#             print(f"⚠️ Budget price check failed: {e}")
+#         # 3️⃣ Detect category (run potentially-blocking call in a thread)
+#
+#     except Exception as e:
+#         print(f"❌ Error in handle_channel_post2: {e}")
 # ===============================
 # 🌐 Quart Web Endpoint
 # ===============================
@@ -388,5 +521,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
