@@ -355,7 +355,7 @@ async def send_budget_149(message: types.Message, final_caption: str):
 
     try:
         extra_html = (
-            "<b>🛍️ 👉 <a href='https://t.me/addlist/WhyK9RPZHdU4MGNl'>Click & Join More Deals</a></b>"
+            "<b>🛍️ 👉 <a href='https://t.me/addlist/zzZb8Deuzy9kZjQ1'>Click & Join More Deals</a></b>"
         )
         Promo = types.InlineKeyboardMarkup(
         inline_keyboard=[
@@ -422,7 +422,7 @@ async def send_budget_149(message: types.Message, final_caption: str):
 # ===============================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("✅ Join @Dealdoom Bro")
+    await message.answer("✅ Join @LootsXpert Bro")
 
 @dp.message(F.text.startswith("silent_"))
 async def set_silent_interval_cmd(message: types.Message):
