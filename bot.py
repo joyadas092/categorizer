@@ -448,14 +448,15 @@ async def handle_channel_post(message: types.Message):
         # 2️⃣ Expand short links without blocking loop
         inputvalue = await expand_short_links(compiled_text)
 
-        # 2.5️⃣ Cross-post to budget channel if price ≤ threshold
-        try:
-            price = await asyncio.to_thread(get_product_price, inputvalue)
-            if price is not None:
-                if price <= PRICE_THRESHOLD_150:
-                    await send_budget_149(message, inputvalue)
-        except Exception as e:
-            print(f"⚠️ Budget price check failed: {e}")
+        # 2.5️⃣ Cross-post to budget channel if price ≤ threshold commented
+        
+        # try:
+        #     price = await asyncio.to_thread(get_product_price, inputvalue)
+        #     if price is not None:
+        #         if price <= PRICE_THRESHOLD_150:
+        #             await send_budget_149(message, inputvalue)
+        # except Exception as e:
+        #     print(f"⚠️ Budget price check failed: {e}")
         # 3️⃣ Detect category (run potentially-blocking call in a thread)
         category = await asyncio.to_thread(get_category, inputvalue)
 
